@@ -1,0 +1,199 @@
+From abf654288c2f7f0ee6e1dd3e34b70c1aabe82ea7 Mon Sep 17 00:00:00 2001
+From: Felix Rath <felix.rath@comsys.rwth-aachen.de>
+Date: Fri, 24 May 2019 15:44:06 +0200
+Subject: [PATCH] Implement handling of the llvm.fabs intrinsic
+
+---
+ lib/Core/Executor.cpp           | 63 +++++++++++++++----------
+ lib/Module/IntrinsicCleaner.cpp |  1 +
+ test/Intrinsics/fabs.ll         | 81 +++++++++++++++++++++++++++++++++
+ 3 files changed, 120 insertions(+), 25 deletions(-)
+ create mode 100644 test/Intrinsics/fabs.ll
+
+diff --git a/lib/Core/Executor.cpp b/lib/Core/Executor.cpp
+index 845fa8ff27..05e20f650a 100644
+--- a/lib/Core/Executor.cpp
++++ b/lib/Core/Executor.cpp
+@@ -1319,6 +1319,28 @@ void Executor::stepInstruction(ExecutionState &state) {
+     haltExecution = true;
+ }
+ 
++static inline const llvm::fltSemantics *fpWidthToSemantics(unsigned width) {
++  switch (width) {
++#if LLVM_VERSION_CODE >= LLVM_VERSION(4, 0)
++  case Expr::Int32:
++    return &llvm::APFloat::IEEEsingle();
++  case Expr::Int64:
++    return &llvm::APFloat::IEEEdouble();
++  case Expr::Fl80:
++    return &llvm::APFloat::x87DoubleExtended();
++#else
++  case Expr::Int32:
++    return &llvm::APFloat::IEEEsingle;
++  case Expr::Int64:
++    return &llvm::APFloat::IEEEdouble;
++  case Expr::Fl80:
++    return &llvm::APFloat::x87DoubleExtended;
++#endif
++  default:
++    return 0;
++  }
++}
++
+ void Executor::executeCall(ExecutionState &state, 
+                            KInstruction *ki,
+                            Function *f,
+@@ -1332,9 +1354,22 @@ void Executor::executeCall(ExecutionState &state,
+       // state may be destroyed by this call, cannot touch
+       callExternalFunction(state, ki, f, arguments);
+       break;
+-        
+-      // va_arg is handled by caller and intrinsic lowering, see comment for
+-      // ExecutionState::varargs
++    case Intrinsic::fabs: {
++      ref<ConstantExpr> arg =
++          toConstant(state, eval(ki, 0, state).value, "floating point");
++      if (!fpWidthToSemantics(arg->getWidth()))
++        return terminateStateOnExecError(
++            state, "Unsupported intrinsic llvm.fabs call");
++
++      llvm::APFloat Res(*fpWidthToSemantics(arg->getWidth()),
++                        arg->getAPValue());
++      Res = llvm::abs(Res);
++
++      bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
++      break;
++    }
++    // va_arg is handled by caller and intrinsic lowering, see comment for
++    // ExecutionState::varargs
+     case Intrinsic::vastart:  {
+       StackFrame &sf = state.stack.back();
+ 
+@@ -1579,28 +1614,6 @@ Function* Executor::getTargetFunction(Value *calledVal, ExecutionState &state) {
+   }
+ }
+ 
+-static inline const llvm::fltSemantics * fpWidthToSemantics(unsigned width) {
+-  switch(width) {
+-#if LLVM_VERSION_CODE >= LLVM_VERSION(4, 0)
+-  case Expr::Int32:
+-    return &llvm::APFloat::IEEEsingle();
+-  case Expr::Int64:
+-    return &llvm::APFloat::IEEEdouble();
+-  case Expr::Fl80:
+-    return &llvm::APFloat::x87DoubleExtended();
+-#else
+-  case Expr::Int32:
+-    return &llvm::APFloat::IEEEsingle;
+-  case Expr::Int64:
+-    return &llvm::APFloat::IEEEdouble;
+-  case Expr::Fl80:
+-    return &llvm::APFloat::x87DoubleExtended;
+-#endif
+-  default:
+-    return 0;
+-  }
+-}
+-
+ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
+   Instruction *i = ki->inst;
+   switch (i->getOpcode()) {
+diff --git a/lib/Module/IntrinsicCleaner.cpp b/lib/Module/IntrinsicCleaner.cpp
+index dde9703601..e2ed3f390f 100644
+--- a/lib/Module/IntrinsicCleaner.cpp
++++ b/lib/Module/IntrinsicCleaner.cpp
+@@ -59,6 +59,7 @@ bool IntrinsicCleanerPass::runOnBasicBlock(BasicBlock &b, Module &M) {
+       switch (ii->getIntrinsicID()) {
+       case Intrinsic::vastart:
+       case Intrinsic::vaend:
++      case Intrinsic::fabs:
+         break;
+ 
+         // Lower vacopy so that object resolution etc is handled by
+diff --git a/test/Intrinsics/fabs.ll b/test/Intrinsics/fabs.ll
+new file mode 100644
+index 0000000000..80febf7094
+--- /dev/null
++++ b/test/Intrinsics/fabs.ll
+@@ -0,0 +1,81 @@
++; LLVM has an intrinsic for fabs.
++; This file is generated from the following code:
++; ```
++;#include <math.h>
++;
++;int main(void) {
++;  float f = -1.;
++;  f = fabs(f);
++;
++;  if(f != 1.)
++;    return 1;
++;
++;  double d = -2.;
++;  d = fabs(d);
++;
++;  if(d != 2.)
++;    return 2;
++;
++;  return 0;
++;}
++; ```
++; To clean the resulting llvm-ir up for LLVM-versions < 6,
++; I ran `opt -S -strip -strip-debug -strip-named-metadata'
++; on the resulting ir. Additionally I removed the 'speculatable'
++; attribute where it appeared. 
++;
++; RUN: %llvmas %s -o=%t.bc
++; RUN: rm -rf %t.klee-out
++; RUN: %klee -exit-on-error --output-dir=%t.klee-out --optimize=false %t.bc
++; ModuleID = 'fabs.c'
++target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
++target triple = "x86_64-pc-linux-gnu"
++
++; Function Attrs: noinline nounwind optnone sspstrong uwtable
++define i32 @main() #0 {
++  %1 = alloca i32, align 4
++  %2 = alloca float, align 4
++  %3 = alloca double, align 8
++  store i32 0, i32* %1, align 4
++  store float -1.000000e+00, float* %2, align 4
++  %4 = load float, float* %2, align 4
++  %5 = fpext float %4 to double
++  %6 = call double @llvm.fabs.f64(double %5)
++  %7 = fptrunc double %6 to float
++  store float %7, float* %2, align 4
++  %8 = load float, float* %2, align 4
++  %9 = fpext float %8 to double
++  %10 = fcmp une double %9, 1.000000e+00
++  br i1 %10, label %11, label %12
++
++; <label>:11:                                     ; preds = %0
++  store i32 1, i32* %1, align 4
++  br label %19
++
++; <label>:12:                                     ; preds = %0
++  store double -2.000000e+00, double* %3, align 8
++  %13 = load double, double* %3, align 8
++  %14 = call double @llvm.fabs.f64(double %13)
++  store double %14, double* %3, align 8
++  %15 = load double, double* %3, align 8
++  %16 = fcmp une double %15, 2.000000e+00
++  br i1 %16, label %17, label %18
++
++; <label>:17:                                     ; preds = %12
++  store i32 2, i32* %1, align 4
++  br label %19
++
++; <label>:18:                                     ; preds = %12
++  store i32 0, i32* %1, align 4
++  br label %19
++
++; <label>:19:                                     ; preds = %18, %17, %11
++  %20 = load i32, i32* %1, align 4
++  ret i32 %20
++}
++
++; Function Attrs: nounwind readnone
++declare double @llvm.fabs.f64(double) #1
++
++attributes #0 = { noinline nounwind optnone sspstrong uwtable "correctly-rounded-divide-sqrt-fp-math"="false" "disable-tail-calls"="false" "less-precise-fpmad"="false" "min-legal-vector-width"="0" "no-frame-pointer-elim"="true" "no-frame-pointer-elim-non-leaf" "no-infs-fp-math"="false" "no-jump-tables"="false" "no-nans-fp-math"="false" "no-signed-zeros-fp-math"="false" "no-trapping-math"="false" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+fxsr,+mmx,+sse,+sse2,+x87" "unsafe-fp-math"="false" "use-soft-float"="false" }
++attributes #1 = { nounwind readnone }
